@@ -29,8 +29,13 @@
 #include "SpellAuraEffects.h"
 #include "Containers.h"
 
+#include <map>
+
 enum DruidSpells
 {
+	SPELL_DRUID_LIFEBLOOM                 = 33763,
+	SPELL_DRUID_LIFEBLOOM_FINAL           = 33778,
+
     SPELL_DRUID_WRATH                       = 5176,
     SPELL_DRUID_STARFIRE                    = 2912,
     SPELL_DRUID_STARSURGE                   = 78674,
@@ -58,6 +63,144 @@ enum DruidSpells
     SPELL_DRUID_STAMPEDE_CAT_STATE          = 109881,
     SPELL_DRUID_TIGER_S_FURY_ENERGIZE       = 51178
 };
+
+// 33763 - Lifebloom
+std::map<Player*, Unit*> LifebloomCastedByOn;
+class spell_dru_lifebloom : public SpellScriptLoader
+{
+public:
+	spell_dru_lifebloom() : SpellScriptLoader("spell_dru_lifebloom") { }
+
+	class spell_dru_lifebloom_AuraScript : public AuraScript
+	{
+		PrepareAuraScript(spell_dru_lifebloom_AuraScript);
+
+		bool Validate(SpellInfo const* /*spell*/) override
+		{
+			//SF_LOG_INFO("server.loading", "DEBUG: Validating Lifebloom Aura");
+			if (!sSpellMgr->GetSpellInfo(SPELL_DRUID_LIFEBLOOM))
+				return false;
+			if (!sSpellMgr->GetSpellInfo(SPELL_DRUID_LIFEBLOOM_FINAL))
+				return false;
+			return true;
+		}
+
+		void AfterRemove(AuraEffect const* aurEff, AuraEffectHandleModes /*mode*/)
+		{
+			// Final heal if removed when having 2 secs or less on stack
+			if (GetDuration() > 2000)
+				return;
+
+			// final heal
+			int32 stack = GetStackAmount();
+			int32 healAmount = aurEff->GetAmount();
+			if (Unit* caster = GetCaster())
+			{
+				healAmount = caster->SpellHealingBonusDone(GetTarget(), GetSpellInfo(), healAmount, HEAL, stack);
+				healAmount = GetTarget()->SpellHealingBonusTaken(caster, GetSpellInfo(), healAmount, HEAL, stack);
+
+				GetTarget()->CastCustomSpell(GetTarget(), SPELL_DRUID_LIFEBLOOM_FINAL, &healAmount, NULL, NULL, true, NULL, aurEff, GetCasterGUID());
+				return;
+			}
+
+			GetTarget()->CastCustomSpell(GetTarget(), SPELL_DRUID_LIFEBLOOM_FINAL, &healAmount, NULL, NULL, true, NULL, aurEff, GetCasterGUID());
+		}
+
+		void HandleDispel(DispelInfo* dispelInfo)
+		{
+			if (Unit* target = GetUnitOwner())
+			{
+				if (AuraEffect const* aurEff = GetEffect(EFFECT_1))
+				{
+					// final heal
+					int32 healAmount = aurEff->GetAmount();
+					if (Unit* caster = GetCaster())
+					{
+						healAmount = caster->SpellHealingBonusDone(target, GetSpellInfo(), healAmount, HEAL, dispelInfo->GetRemovedCharges());
+						healAmount = target->SpellHealingBonusTaken(caster, GetSpellInfo(), healAmount, HEAL, dispelInfo->GetRemovedCharges());
+						target->CastCustomSpell(target, SPELL_DRUID_LIFEBLOOM_FINAL, &healAmount, NULL, NULL, true, NULL, NULL, GetCasterGUID());
+						return;
+					}
+
+					target->CastCustomSpell(target, SPELL_DRUID_LIFEBLOOM_FINAL, &healAmount, NULL, NULL, true, NULL, NULL, GetCasterGUID());
+				}
+			}
+		}
+
+		void HandleProc(ProcEventInfo& eventInfo) // Refresh Lifebloom if healed:
+		{
+			// Handle being healed by: Healing Touch, Nourish, Regrowth
+			Aura* myAura = GetAura();
+			if (eventInfo.GetActor() == myAura->GetCaster())
+			{
+				myAura->RefreshDuration();
+			}
+		}
+		
+		void Register() override
+		{
+			AfterEffectRemove    += AuraEffectRemoveFn    (spell_dru_lifebloom_AuraScript::AfterRemove,  EFFECT_1, SPELL_AURA_DUMMY, AURA_EFFECT_HANDLE_REAL);
+			AfterDispel          += AuraDispelFn          (spell_dru_lifebloom_AuraScript::HandleDispel);
+			OnProc               += AuraProcFn            (spell_dru_lifebloom_AuraScript::HandleProc);
+		}
+	};
+
+	class spell_dru_lifebloom_SpellScript : public SpellScript
+	{
+		PrepareSpellScript(spell_dru_lifebloom_SpellScript);
+
+		void AfterSpellCast()
+		{
+			if (Player* caster = GetCaster()->ToPlayer())
+			{
+				if (Unit* currenttarget = GetExplTargetUnit())
+				{
+					auto LastTarget = LifebloomCastedByOn.find(caster);
+					if (LastTarget != LifebloomCastedByOn.end()) // Have casted it before
+					{
+						if (LastTarget->second != currenttarget)
+						{
+							if (Aura* LastTargetAura = LastTarget->second->GetAura(SPELL_DRUID_LIFEBLOOM, caster->GetGUID())) // Last target we casted on still has Lifebloom
+							{
+								if (LastTargetAura->GetDuration() > 2000) // more than two seconds remained, so we transfer stack
+								{
+									Aura* CurrentTargetAura = currenttarget->GetAura(SPELL_DRUID_LIFEBLOOM, caster->GetGUID());
+									uint8 StackToSet = (LastTargetAura->GetStackAmount() == 3 ? 3 : LastTargetAura->GetStackAmount() + 1);
+									CurrentTargetAura->SetStackAmount(StackToSet);
+									LastTargetAura->Remove(AURA_REMOVE_BY_CANCEL);
+								}
+								else // Less than 2 seconds remain: force-bloom + default behaviour
+									LastTargetAura->Remove(AURA_REMOVE_BY_EXPIRE);
+							}
+							// lifebloom already expired on last target -> default behaviour
+						}
+
+						LastTarget->second = currenttarget;	// Set our current target as last casted on
+					}
+					else // no lifebloom was casted before -> default behaviour + insert into map
+						LifebloomCastedByOn.insert({ caster, currenttarget });
+				}
+			}
+		}
+
+		void Register() override
+		{
+			AfterCast   += SpellCastFn     (spell_dru_lifebloom_SpellScript::AfterSpellCast);
+		}
+	};
+
+	SpellScript* GetSpellScript() const override
+	{
+		return new spell_dru_lifebloom_SpellScript();
+	}
+
+	AuraScript* GetAuraScript() const override
+	{
+		return new spell_dru_lifebloom_AuraScript();
+	}
+};
+
+//========================================================================================================================================================================
 
 // 1850 - Dash
 class spell_dru_dash : public SpellScriptLoader
@@ -395,88 +538,6 @@ class spell_dru_innervate : public SpellScriptLoader
         AuraScript* GetAuraScript() const override
         {
             return new spell_dru_innervate_AuraScript();
-        }
-};
-
-// 33763 - Lifebloom
-class spell_dru_lifebloom : public SpellScriptLoader
-{
-    public:
-        spell_dru_lifebloom() : SpellScriptLoader("spell_dru_lifebloom") { }
-
-        class spell_dru_lifebloom_AuraScript : public AuraScript
-        {
-            PrepareAuraScript(spell_dru_lifebloom_AuraScript);
-
-            bool Validate(SpellInfo const* /*spell*/) override
-            {
-                if (!sSpellMgr->GetSpellInfo(SPELL_DRUID_LIFEBLOOM_FINAL_HEAL))
-                    return false;
-                if (!sSpellMgr->GetSpellInfo(SPELL_DRUID_LIFEBLOOM_ENERGIZE))
-                    return false;
-                return true;
-            }
-
-            void AfterRemove(AuraEffect const* aurEff, AuraEffectHandleModes /*mode*/)
-            {
-                // Final heal only on duration end
-                if (GetTargetApplication()->GetRemoveMode() != AURA_REMOVE_BY_EXPIRE)
-                    return;
-
-                // final heal
-                int32 stack = GetStackAmount();
-                int32 healAmount = aurEff->GetAmount();
-                if (Unit* caster = GetCaster())
-                {
-                    healAmount = caster->SpellHealingBonusDone(GetTarget(), GetSpellInfo(), healAmount, HEAL, stack);
-                    healAmount = GetTarget()->SpellHealingBonusTaken(caster, GetSpellInfo(), healAmount, HEAL, stack);
-
-                    GetTarget()->CastCustomSpell(GetTarget(), SPELL_DRUID_LIFEBLOOM_FINAL_HEAL, &healAmount, NULL, NULL, true, NULL, aurEff, GetCasterGUID());
-
-                    // restore mana
-                    int32 returnMana = CalculatePct(caster->GetCreateMana(), GetSpellInfo()->ManaCostPercentage) * stack / 2;
-                    caster->CastCustomSpell(caster, SPELL_DRUID_LIFEBLOOM_ENERGIZE, &returnMana, NULL, NULL, true, NULL, aurEff, GetCasterGUID());
-                    return;
-                }
-
-                GetTarget()->CastCustomSpell(GetTarget(), SPELL_DRUID_LIFEBLOOM_FINAL_HEAL, &healAmount, NULL, NULL, true, NULL, aurEff, GetCasterGUID());
-            }
-
-            void HandleDispel(DispelInfo* dispelInfo)
-            {
-                if (Unit* target = GetUnitOwner())
-                {
-                    if (AuraEffect const* aurEff = GetEffect(EFFECT_1))
-                    {
-                        // final heal
-                        int32 healAmount = aurEff->GetAmount();
-                        if (Unit* caster = GetCaster())
-                        {
-                            healAmount = caster->SpellHealingBonusDone(target, GetSpellInfo(), healAmount, HEAL, dispelInfo->GetRemovedCharges());
-                            healAmount = target->SpellHealingBonusTaken(caster, GetSpellInfo(), healAmount, HEAL, dispelInfo->GetRemovedCharges());
-                            target->CastCustomSpell(target, SPELL_DRUID_LIFEBLOOM_FINAL_HEAL, &healAmount, NULL, NULL, true, NULL, NULL, GetCasterGUID());
-
-                            // restore mana
-                            int32 returnMana = CalculatePct(caster->GetCreateMana(), GetSpellInfo()->ManaCostPercentage) * dispelInfo->GetRemovedCharges() / 2;
-                            caster->CastCustomSpell(caster, SPELL_DRUID_LIFEBLOOM_ENERGIZE, &returnMana, NULL, NULL, true, NULL, NULL, GetCasterGUID());
-                            return;
-                        }
-
-                        target->CastCustomSpell(target, SPELL_DRUID_LIFEBLOOM_FINAL_HEAL, &healAmount, NULL, NULL, true, NULL, NULL, GetCasterGUID());
-                    }
-                }
-            }
-
-            void Register() override
-            {
-                AfterEffectRemove += AuraEffectRemoveFn(spell_dru_lifebloom_AuraScript::AfterRemove, EFFECT_1, SPELL_AURA_DUMMY, AURA_EFFECT_HANDLE_REAL);
-                AfterDispel += AuraDispelFn(spell_dru_lifebloom_AuraScript::HandleDispel);
-            }
-        };
-
-        AuraScript* GetAuraScript() const override
-        {
-            return new spell_dru_lifebloom_AuraScript();
         }
 };
 
@@ -944,6 +1005,8 @@ class spell_dru_t10_restoration_4p_bonus : public SpellScriptLoader
 
 void AddSC_druid_spell_scripts()
 {
+	new spell_dru_lifebloom();
+
     new spell_dru_dash();
     new spell_dru_eclipse("spell_dru_eclipse_lunar");
     new spell_dru_eclipse("spell_dru_eclipse_solar");
@@ -952,7 +1015,11 @@ void AddSC_druid_spell_scripts()
     new spell_dru_glyph_of_starfire();
     new spell_dru_glyph_of_starfire_proc();
     new spell_dru_innervate();
+<<<<<<< HEAD
     new spell_dru_lifebloom();
+=======
+    new spell_dru_insect_swarm();
+>>>>>>> 25e92033222979ebe76d90e051b24809f0e93eea
     new spell_dru_living_seed();
     new spell_dru_living_seed_proc();
     new spell_dru_predatory_strikes();
